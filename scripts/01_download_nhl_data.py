@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, local
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -25,6 +27,8 @@ parser.add_argument("--start-year", type=int, default=2016,
 parser.add_argument("--refresh-days", type=int, default=7)
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
+parser.add_argument("--workers", type=int, default=4,
+                    help="Concurrent game workers (default: 4)")
 parser.add_argument("--games-only", action="store_true",
                     help="Download gamecenter and shift-chart files; skip supplementary datasets")
 args = parser.parse_args()
@@ -46,6 +50,17 @@ import boto3
 from botocore.exceptions import ClientError
 s3 = boto3.client("s3")
 
+# List existing S3 objects once instead of checking each file individually.
+archive_prefix = "/".join(filter(None, [prefix, "raw-api-data"])) + "/"
+objects = set()
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=archive_prefix):
+    objects.update(item["Key"] for item in page.get("Contents", []))
+print(f"S3 inventory: {len(objects):,} archived objects.", flush=True)
+
+# Each worker has its own HTTP session; shared counters use a lock.
+lock = Lock()
+worker_local = local()
+
 # A single download function keeps retry, caching, and atomic writes consistent.
 # Missing historical endpoints (404) are recorded so they are not retried every night.
 counts = {"new": 0, "updated": 0, "cached": 0, "unavailable": 0, "failed": 0}
@@ -54,44 +69,36 @@ download_limit_reached = False
 test_downloads = 0
 
 
-def get_json(url, path, params=None, refresh=False, count_limit=True):
+def get_json(url, path, params=None, refresh=False, count_limit=True, read_data=True):
     global download_limit_reached, test_downloads
 
     # Use the same S3 object key on both the MacBook and EC2.
     key = "/".join(filter(None, [prefix, "raw-api-data", path.relative_to(RAW).as_posix()]))
     missing_marker = path.with_suffix(".unavailable")
 
-    # Reconcile local and cloud copies before deciding to contact the NHL API.
-    # Any S3 failure other than a missing object is a real error, not a cache miss.
+    # Reuse the S3 inventory and avoid restoring game files we do not need to read.
     if not (args.overwrite or refresh):
-        try:
-            s3.head_object(Bucket=bucket, Key=key)
-            in_s3 = True
-        except ClientError as error:
-            code = error.response["Error"]["Code"]
-            if code not in ("404", "NoSuchKey", "NotFound"):
-                raise
-            in_s3 = False
+        if key in objects:
+            if read_data and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".json.tmp")
+                s3.download_file(bucket, key, str(temporary))
+                temporary.replace(path)
+            with lock:
+                counts["cached"] += 1
+            return json.loads(path.read_text(encoding="utf-8")) if read_data else None
 
-        # An existing local file not yet in S3 must be archived, not skipped.
+        # Preserve a locally downloaded file by uploading it if S3 lacks the key.
         if path.exists():
-            if not in_s3:
-                s3.upload_file(str(path), bucket, key)
-            counts["cached"] += 1
-            return json.loads(path.read_text(encoding="utf-8"))
+            s3.upload_file(str(path), bucket, key)
+            with lock:
+                objects.add(key)
+                counts["cached"] += 1
+            return json.loads(path.read_text(encoding="utf-8")) if read_data else None
 
-        # Restore an archived response rather than redownloading from the API.
-        if in_s3:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".json.tmp")
-            s3.download_file(bucket, key, str(temporary))
-            temporary.replace(path)
-            counts["cached"] += 1
-            return json.loads(path.read_text(encoding="utf-8"))
-
-        # A previously confirmed unavailable historical endpoint can be skipped.
         if missing_marker.exists():
-            counts["unavailable"] += 1
+            with lock:
+                counts["unavailable"] += 1
             return None
 
     # Bound successful API downloads when testing, without limiting cache restoration.
@@ -101,18 +108,24 @@ def get_json(url, path, params=None, refresh=False, count_limit=True):
 
     # Fetch the NHL response; mark historical 404s only when not refreshing.
     try:
-        response = session.get(url, params=params, timeout=30)
+        # Separate sessions prevent cross-thread sharing of Requests state.
+        if not hasattr(worker_local, "session"):
+            worker_local.session = requests.Session()
+            worker_local.session.mount("https://", HTTPAdapter(max_retries=retry))
+        response = worker_local.session.get(url, params=params, timeout=30)
         if response.status_code == 404:
             if not (args.overwrite or refresh):
                 missing_marker.parent.mkdir(parents=True, exist_ok=True)
                 missing_marker.write_text(url + "\n", encoding="utf-8")
-            counts["unavailable"] += 1
+            with lock:
+                counts["unavailable"] += 1
             return None
         response.raise_for_status()
         data = response.json()
     except (requests.RequestException, ValueError) as error:
-        counts["failed"] += 1
-        failures.append(f"{path}: {error}")
+        with lock:
+            counts["failed"] += 1
+            failures.append(f"{path}: {error}")
         return None
 
     # Write the source response safely, then publish it to the shared S3 archive.
@@ -125,15 +138,18 @@ def get_json(url, path, params=None, refresh=False, count_limit=True):
     try:
         s3.upload_file(str(path), bucket, key)
     except Exception as error:
-        counts["failed"] += 1
-        failures.append(f"S3 {key}: {error}")
+        with lock:
+            counts["failed"] += 1
+            failures.append(f"S3 {key}: {error}")
         return data
 
     if missing_marker.exists():
         missing_marker.unlink()
-    counts["updated" if refresh or args.overwrite else "new"] += 1
-    if count_limit:
-        test_downloads += 1
+    with lock:
+        objects.add(key)
+        counts["updated" if refresh or args.overwrite else "new"] += 1
+        if count_limit:
+            test_downloads += 1
     time.sleep(0.05)
     return data
 
@@ -248,25 +264,38 @@ completed_games = {
     and date.fromisoformat(game["gameDate"]) <= today
 }
 print(f"Completed games eligible for download: {len(completed_games):,}")
-for game_number, (game_id, game) in enumerate(sorted(completed_games.items()), start=1):
-    if download_limit_reached:
-        break
+# Workers process separate games; a small download-limit test stays sequential.
+def download_game(item):
+    game_id, game = item
     game_date = date.fromisoformat(game["gameDate"])
     refresh = game_date >= recent_cutoff
     season = game["season"]
+
     for name, endpoint in game_endpoints.items():
+        if download_limit_reached:
+            break
         url = f"{WEB}/gamecenter/{game_id}/{endpoint}"
-        get_json(url, RAW / season / name / f"{game_id}.json", refresh=refresh)
+        get_json(url, RAW / season / name / f"{game_id}.json",
+                 refresh=refresh, read_data=False)
 
-    # Request official shifts from the Stats REST endpoint for the same game.
-    params = {"cayenneExp": f"gameId={game_id}", "limit": -1}
-    get_json(f"{STATS}/shiftcharts", RAW / season / "shifts" / f"{game_id}.json",
-             params=params, refresh=refresh)
+    if not download_limit_reached:
+        params = {"cayenneExp": f"gameId={game_id}", "limit": -1}
+        get_json(f"{STATS}/shiftcharts", RAW / season / "shifts" / f"{game_id}.json",
+                 params=params, refresh=refresh, read_data=False)
 
-    if game_number % 25 == 0 or game_number == len(completed_games):
-        print(f"Game progress: {game_number:,}/{len(completed_games):,} "
-              f"| new={counts['new']} cached={counts['cached']} "
-              f"unavailable={counts['unavailable']} failed={counts['failed']}", flush=True)
+
+# Process games in parallel and show progress every 25 completed game workers.
+game_items = sorted(completed_games.items())
+workers = 1 if args.max_downloads else max(1, args.workers)
+with ThreadPoolExecutor(max_workers=workers) as executor:
+    futures = [executor.submit(download_game, item) for item in game_items]
+    for game_number, future in enumerate(as_completed(futures), start=1):
+        future.result()
+        if game_number % 25 == 0 or game_number == len(game_items):
+            print(f"Game progress: {game_number:,}/{len(game_items):,} "
+                  f"| new={counts['new']} cached={counts['cached']} "
+                  f"unavailable={counts['unavailable']} failed={counts['failed']}",
+                  flush=True)
 
 # Run the game archive by itself before collecting supplementary datasets.
 # This makes a full-season pilot easier to validate and safely resume.
