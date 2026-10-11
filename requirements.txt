@@ -1,0 +1,7 @@
+# Direct dependencies for NHL ingestion, Parquet preparation, and VS Code Jupyter.
+boto3
+requests
+pandas
+pyarrow
+duckdb
+ipykernel
