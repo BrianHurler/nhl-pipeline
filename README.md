@@ -28,24 +28,13 @@ nhl-pipeline/
 
 The two data directories are for data, not source code. Avoid committing large generated datasets or API archives to Git.
 
-## Intended workflow
+## Pipeline Workflow
 
 1. Download NHL API responses into `raw-api-data/`.
 2. Parse and standardize source data into consistently typed tables.
 3. Build reusable, analysis-ready Parquet datasets in `aws-parquet-data/`.
 4. Publish Parquet outputs to AWS S3.
 5. Read the published datasets from separate modeling and reporting repositories.
-
-Earlier pipeline work used `s3://nhl-data-bucket1/nhl-data-research/`. Final cloud paths will be reviewed during script migration.
-
-## Local setup
-
-```bash
-cd ~/Documents/GitHub
-git clone https://github.com/BrianHurler/nhl-pipeline.git
-cd nhl-pipeline
-code .
-```
 
 ## Development and security
 
