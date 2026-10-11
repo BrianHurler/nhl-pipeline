@@ -39,6 +39,7 @@ bucket = os.environ["NHL_S3_BUCKET"]
 prefix = os.getenv("NHL_S3_PREFIX", "").strip("/")
 
 import boto3
+from botocore.exceptions import ClientError
 s3 = boto3.client("s3")
 
 # A single download function keeps retry, caching, and atomic writes consistent.
@@ -51,27 +52,55 @@ download_limit_reached = False
 def get_json(url, path, params=None, refresh=False):
     global download_limit_reached
 
-    # Skip archived data; refresh only requested recent records or explicit overwrites.
+    # Use the same S3 object key on both the MacBook and EC2.
+    key = "/".join(filter(None, [prefix, "raw-api-data", path.relative_to(RAW).as_posix()]))
     missing_marker = path.with_suffix(".unavailable")
-    if missing_marker.exists() and not args.overwrite:
-        counts["unavailable"] += 1
-        return None
-    if path.exists() and not (args.overwrite or refresh):
-        counts["cached"] += 1
-        return json.loads(path.read_text(encoding="utf-8"))
 
-    # Bound the number of network downloads for safe initial testing.
+    # Reconcile local and cloud copies before deciding to contact the NHL API.
+    # Any S3 failure other than a missing object is a real error, not a cache miss.
+    if not (args.overwrite or refresh):
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            in_s3 = True
+        except ClientError as error:
+            code = error.response["Error"]["Code"]
+            if code not in ("404", "NoSuchKey", "NotFound"):
+                raise
+            in_s3 = False
+
+        # An existing local file not yet in S3 must be archived, not skipped.
+        if path.exists():
+            if not in_s3:
+                s3.upload_file(str(path), bucket, key)
+            counts["cached"] += 1
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        # Restore an archived response rather than redownloading from the API.
+        if in_s3:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".json.tmp")
+            s3.download_file(bucket, key, str(temporary))
+            temporary.replace(path)
+            counts["cached"] += 1
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        # A previously confirmed unavailable historical endpoint can be skipped.
+        if missing_marker.exists():
+            counts["unavailable"] += 1
+            return None
+
+    # Bound successful API downloads when testing, without limiting cache restoration.
     if args.max_downloads and counts["new"] + counts["updated"] >= args.max_downloads:
         download_limit_reached = True
         return None
 
-    # Fetch the original response; treat unavailable historical endpoints separately.
+    # Fetch the NHL response; mark historical 404s only when not refreshing.
     try:
         response = session.get(url, params=params, timeout=30)
         if response.status_code == 404:
-            if not refresh:
+            if not (args.overwrite or refresh):
                 missing_marker.parent.mkdir(parents=True, exist_ok=True)
-                missing_marker.write_text(url + "\n", encoding="utf-8")
+                missing_marker.write_text(url + "\\n", encoding="utf-8")
             counts["unavailable"] += 1
             return None
         response.raise_for_status()
@@ -81,24 +110,25 @@ def get_json(url, path, params=None, refresh=False):
         failures.append(f"{path}: {error}")
         return None
 
-    # Save completed JSON atomically to avoid treating interrupted downloads as complete.
+    # Write the source response safely, then publish it to the shared S3 archive.
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(data), encoding="utf-8")
     temporary.replace(path)
-    counts["updated" if refresh or args.overwrite else "new"] += 1
 
-    # Upload newly saved source JSON when an AWS bucket is configured.
-    if s3:
-        key = "/".join(filter(None, [prefix, "raw-api-data", path.relative_to(RAW).as_posix()]))
-        try:
-            s3.upload_file(str(path), bucket, key)
-        except Exception as error:
-            counts["failed"] += 1
-            failures.append(f"S3 {key}: {error}")
+    # Never mark an upload failure as successful; the next run can retry it.
+    try:
+        s3.upload_file(str(path), bucket, key)
+    except Exception as error:
+        counts["failed"] += 1
+        failures.append(f"S3 {key}: {error}")
+        return data
+
+    if missing_marker.exists():
+        missing_marker.unlink()
+    counts["updated" if refresh or args.overwrite else "new"] += 1
     time.sleep(0.05)
     return data
-
 
 # Retrieve official season, team and reference catalogs before scheduling jobs.
 # Cached references are refreshed daily, because they discover new seasons and teams.
