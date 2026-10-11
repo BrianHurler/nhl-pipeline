@@ -47,10 +47,11 @@ s3 = boto3.client("s3")
 counts = {"new": 0, "updated": 0, "cached": 0, "unavailable": 0, "failed": 0}
 failures = []
 download_limit_reached = False
+test_downloads = 0
 
 
-def get_json(url, path, params=None, refresh=False):
-    global download_limit_reached
+def get_json(url, path, params=None, refresh=False, count_limit=True):
+    global download_limit_reached, test_downloads
 
     # Use the same S3 object key on both the MacBook and EC2.
     key = "/".join(filter(None, [prefix, "raw-api-data", path.relative_to(RAW).as_posix()]))
@@ -90,7 +91,7 @@ def get_json(url, path, params=None, refresh=False):
             return None
 
     # Bound successful API downloads when testing, without limiting cache restoration.
-    if args.max_downloads and counts["new"] + counts["updated"] >= args.max_downloads:
+    if count_limit and args.max_downloads and test_downloads >= args.max_downloads:
         download_limit_reached = True
         return None
 
@@ -127,6 +128,8 @@ def get_json(url, path, params=None, refresh=False):
     if missing_marker.exists():
         missing_marker.unlink()
     counts["updated" if refresh or args.overwrite else "new"] += 1
+    if count_limit:
+        test_downloads += 1
     time.sleep(0.05)
     return data
 
@@ -146,7 +149,7 @@ references = {
 }
 reference_data = {}
 for name, url in references.items():
-    reference_data[name] = get_json(url, RAW / "reference" / f"{name}.json", refresh=True)
+    reference_data[name] = get_json(url, RAW / "reference" / f"{name}.json", refresh=True, count_limit=False)
 
 # Build an all-history season list from the NHL season catalog, not a hardcoded year.
 # The season filter is useful when backfilling or testing one season.
@@ -179,13 +182,14 @@ for season in seasons:
             break
         url = f"{WEB}/club-schedule-season/{team}/{season}"
         path = RAW / "schedules" / season / f"{team}.json"
-        schedule = get_json(url, path, refresh=season.startswith(str(current_start_year))) or {}
+        schedule = get_json(url, path, refresh=season.startswith(str(current_start_year)), count_limit=False) or {}
         for game in schedule.get("games", []):
             if game.get("id"):
                 games[int(game["id"])] = {"season": season, **game}
     if download_limit_reached:
         break
 print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
+print("Game download test limit:", args.max_downloads or "unlimited")
 
 # Fetch the three NHL gamecenter feeds plus shift charts for played games.
 # Refresh recent games to capture NHL corrections or delayed statistics.
