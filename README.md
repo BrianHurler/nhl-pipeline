@@ -21,12 +21,11 @@ nhl-pipeline/
 └── aws-parquet-data/         # Generated Parquet datasets for AWS S3
 ```
 
-- **`run_all.py` (planned):** Top-level entry point to execute the pipeline scripts in order.
+- **`run_all.py`:** Top-level entry point to execute the pipeline scripts in order.
 - **`scripts/`:** Python scripts for downloading, processing, and publishing NHL datasets.
 - **`raw-api-data/`:** Local storage for original downloaded NHL API responses.
 - **`aws-parquet-data/`:** Local storage for generated Parquet datasets intended for AWS S3.
 
-The two data directories are for data, not source code. Avoid committing large generated datasets or API archives to Git.
 
 ## Pipeline Workflow
 
