@@ -33,14 +33,13 @@ today = date.today()
 recent_cutoff = today - timedelta(days=args.refresh_days)
 current_start_year = today.year if today.month >= 8 else today.year - 1
 
-# Optionally publish raw JSON to S3 using standard AWS credentials on either machine.
-# Local files remain the input for subsequent preparation scripts.
-bucket = os.getenv("NHL_S3_BUCKET")
+# Require an S3 destination so downloaded raw records are durably archived.
+# Boto3 uses your local AWS profile or EC2 instance role for authentication.
+bucket = os.environ["NHL_S3_BUCKET"]
 prefix = os.getenv("NHL_S3_PREFIX", "").strip("/")
-s3 = None
-if bucket:
-    import boto3
-    s3 = boto3.client("s3")
+
+import boto3
+s3 = boto3.client("s3")
 
 # A single download function keeps retry, caching, and atomic writes consistent.
 # Missing historical endpoints (404) are recorded so they are not retried every night.
