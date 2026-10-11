@@ -1,0 +1,18 @@
+# Keep the project-specific Python environment out of Git.
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Archive downloaded JSON and generated Parquet in S3, not Git.
+raw-api-data/*
+!raw-api-data/.gitkeep
+aws-parquet-data/*
+!aws-parquet-data/.gitkeep
+
+# Exclude local credentials, configuration overrides, and temporary files.
+.env
+.env.*
+!.env.example
+*.tmp
+.DS_Store
