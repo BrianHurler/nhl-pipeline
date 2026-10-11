@@ -185,7 +185,7 @@ for season in seasons:
         schedule = get_json(url, path, refresh=season.startswith(str(current_start_year)), count_limit=False) or {}
         for game in schedule.get("games", []):
             if game.get("id"):
-                games[int(game["id"])] = {"season": season, **game}
+                games[int(game["id"])] = {**game, "season": season}
     if download_limit_reached:
         break
 print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
