@@ -167,42 +167,72 @@ else:
 if not seasons:
     raise RuntimeError("No NHL seasons discovered. Check the season reference endpoint.")
 
-# Generate the team abbreviation universe from the API, including historical clubs.
-# Fallback abbreviations supplement historical aliases that may not appear in the catalog.
+# Use the league-wide Stats REST game catalog, independent of team expansion.
+# Keep the original paginated responses in S3 alongside other raw NHL JSON.
+# Team IDs are mapped to abbreviations only for downstream roster/stat requests.
 teams_data = reference_data.get("teams") or {}
-team_codes = {
-    str(row.get("triCode") or row.get("abbrev") or "").upper()
+team_by_id = {
+    int(row["id"]): str(row.get("triCode") or row.get("abbrev") or "").upper()
     for row in teams_data.get("data", [])
+    if row.get("id") is not None
 }
-team_codes |= {"ATL", "ARI", "PHX", "QUE", "HFD", "WIN", "MNS", "CLR", "KCS", "CLE"}
-team_codes = sorted(team for team in team_codes if len(team) == 3 and team.isalpha())
 
-# Discover game IDs using season schedules and retain the original schedule JSON.
-# Do not request future-game play-by-play or game reports.
 games = {}
+page_size = 500
 for season in seasons:
-    for team in team_codes:
-        if download_limit_reached:
+    start = 0
+    season_games = 0
+    while True:
+        params = {"cayenneExp": f"season={season}", "start": start, "limit": page_size}
+        path = RAW / "game_catalog" / season / f"page_{start}.json"
+        catalog = get_json(f"{STATS}/game", path, params=params,
+                           refresh=season.startswith(str(current_start_year)),
+                           count_limit=False)
+        if not isinstance(catalog, dict) or not isinstance(catalog.get("data"), list):
+            raise RuntimeError(f"Missing or unexpected NHL game catalog for {season}, page {start}")
+        rows = catalog["data"]
+        if not rows and start == 0:
+            raise RuntimeError(f"NHL game catalog returned no games for {season}")
+        for row in rows:
+            required = ("id", "season", "gameDate", "gameType", "gameStateId",
+                        "homeTeamId", "visitingTeamId")
+            missing = [field for field in required if row.get(field) is None]
+            if missing:
+                raise RuntimeError(f"Game catalog schema changed: missing {missing} in {row}")
+            if str(row["season"]) != season:
+                raise RuntimeError(f"Unexpected season in catalog: {row['season']} (requested {season})")
+            game_id = int(row["id"])
+            games[game_id] = {
+                "id": game_id,
+                "season": season,
+                "gameDate": str(row["gameDate"])[:10],
+                "gameType": int(row["gameType"]),
+                "gameStateId": int(row["gameStateId"]),
+                "homeTeam": {"abbrev": team_by_id.get(int(row["homeTeamId"]))},
+                "awayTeam": {"abbrev": team_by_id.get(int(row["visitingTeamId"]))},
+            }
+        season_games += len(rows)
+        start += len(rows)
+        total = catalog.get("total")
+        if total is not None:
+            if start >= int(total):
+                break
+        elif len(rows) < page_size:
             break
-        url = f"{WEB}/club-schedule-season/{team}/{season}"
-        path = RAW / "schedules" / season / f"{team}.json"
-        schedule = get_json(url, path, refresh=season.startswith(str(current_start_year)), count_limit=False) or {}
-        for game in schedule.get("games", []):
-            if game.get("id"):
-                games[int(game["id"])] = {**game, "season": season}
-    if download_limit_reached:
-        break
+        if not rows:
+            raise RuntimeError(f"Catalog pagination ended early for {season}: {start}/{total}")
+    print(f"{season}: {season_games:,} league-wide game records discovered.")
+
 print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
 print("Game download test limit:", args.max_downloads or "unlimited")
 
-# Count game states so scheduled and ongoing games remain visible in discovery.
-# Only OFF and FINAL games are eligible for completed-game API archives.
+# Game state IDs 6 and 7 represent completed games in the Stats REST feed.
+# Retain all states in the archived catalog and download gamecenter files only when finished.
 game_states = {}
 for game in games.values():
-    state = game.get("gameState", "UNKNOWN")
+    state = game["gameStateId"]
     game_states[state] = game_states.get(state, 0) + 1
-print("Discovered game states:", dict(sorted(game_states.items())))
-
+print("Discovered game state IDs:", dict(sorted(game_states.items())))
 # Fetch the three gamecenter feeds and shift charts for completed games only.
 # Recent completed games are refreshed to capture corrections.
 game_endpoints = {
@@ -212,7 +242,7 @@ game_endpoints = {
 }
 completed_games = {
     game_id: game for game_id, game in games.items()
-    if game.get("gameState") in ("OFF", "FINAL")
+    if game["gameStateId"] in (6, 7)
     and date.fromisoformat(game["gameDate"]) <= today
 }
 print(f"Completed games eligible for download: {len(completed_games):,}")
