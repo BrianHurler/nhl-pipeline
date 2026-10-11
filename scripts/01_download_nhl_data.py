@@ -27,6 +27,8 @@ parser.add_argument("--start-year", type=int, default=2016,
 parser.add_argument("--refresh-days", type=int, default=7)
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
+parser.add_argument("--max-games", type=int, default=0,
+                    help="Process only the first N games for a short benchmark")
 parser.add_argument("--workers", type=int, default=4,
                     help="Concurrent game workers (default: 4)")
 parser.add_argument("--games-only", action="store_true",
@@ -286,7 +288,10 @@ def download_game(item):
 
 # Process games in parallel and show progress every 25 completed game workers.
 game_items = sorted(completed_games.items())
+if args.max_games:
+    game_items = game_items[:args.max_games]
 workers = 1 if args.max_downloads else max(1, args.workers)
+print(f"Processing {len(game_items):,} games with {workers} worker(s).", flush=True)
 with ThreadPoolExecutor(max_workers=workers) as executor:
     futures = [executor.submit(download_game, item) for item in game_items]
     for game_number, future in enumerate(as_completed(futures), start=1):
