@@ -38,3 +38,19 @@ nhl-pipeline/
 ## Development and security
 
 Follow [AGENTS.md](AGENTS.md): prioritize short, readable, mostly inline Python with concise comments above logical blocks. Use AWS profiles or environment variables for credentials; never commit access keys, tokens, or local secret files.
+
+## Architecture Plan
+
+The pipeline will use **Python + DuckDB + Parquet + AWS S3** to maintain reusable NHL datasets with minimal infrastructure and operating cost.
+
+- **Historical coverage:** Discover and retrieve all seasons and game types supported by the relevant NHL API endpoints. Document differences in historical endpoint availability.
+- **Incremental ingestion:** Compare expected API records with the saved raw archive, download missing records, and refresh recent games that may have been corrected. After the initial historical backfill, nightly runs should process only new or changed source records, including anything missed during downtime.
+- **Raw archive:** Preserve original JSON responses in `raw-api-data/` and durable cloud storage so transformations can be reproduced.
+- **Transformations:** Use Python for API retrieval and orchestration; use DuckDB SQL where it simplifies joins, deduplication, and incremental table preparation.
+- **Analytical datasets:** Maintain **one logical dataset per table** across all seasons. Use season-partitioned Parquet files for large tables (such as plays, shots, and shifts) and single Parquet files for small reference tables. Store local outputs in `aws-parquet-data/` and publish datasets to S3.
+- **Updates and publication:** Rebuild only affected partitions where practical, preserve historical records, and avoid exposing partially updated datasets. Treat S3 as the shared source of truth for published data.
+- **Execution:** Keep a top-level `run_all.py` that runs independent scripts from `scripts/` in dependency order. Prefer mostly inline, readable Python over unnecessary abstractions.
+- **Portability and scheduling:** Run the same pipeline on macOS or AWS EC2 Linux using relative project paths and standard AWS credential configuration. Schedule nightly production runs on EC2.
+- **Scope:** Remove exploratory analyses and redundant QA from the production pipeline, while retaining essential checks that prevent silent data corruption or loss. Downstream models and reporting belong in separate repositories.
+
+This is the target architecture; implementation will proceed as the existing preparation scripts are reviewed and migrated.
