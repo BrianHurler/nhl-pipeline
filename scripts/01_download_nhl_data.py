@@ -1,0 +1,297 @@
+# Download NHL API responses without transforming them into analytical tables.
+# Re-running this script skips saved JSON, except for recently changed records.
+import argparse
+import json
+import os
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Locate the repository on macOS or Linux, independently of the terminal directory.
+ROOT = Path(__file__).resolve().parents[1]
+RAW = ROOT / "raw-api-data"
+WEB = "https://api-web.nhle.com/v1"
+STATS = "https://api.nhle.com/stats/rest/en"
+
+# Select a historical season, limit a test run, or request a deliberate refresh.
+parser = argparse.ArgumentParser(description="Download missing NHL API JSON records.")
+parser.add_argument("--season-id", help="Optional eight-digit NHL season ID")
+parser.add_argument("--refresh-days", type=int, default=7)
+parser.add_argument("--overwrite", action="store_true")
+parser.add_argument("--max-downloads", type=int, default=0)
+args = parser.parse_args()
+
+# Retry transient connection/server failures rather than saving incomplete responses.
+retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+session = requests.Session()
+session.mount("https://", HTTPAdapter(max_retries=retry))
+today = date.today()
+recent_cutoff = today - timedelta(days=args.refresh_days)
+
+# Optionally publish raw JSON to S3 using standard AWS credentials on either machine.
+# Local files remain the input for subsequent preparation scripts.
+bucket = os.getenv("NHL_S3_BUCKET")
+prefix = os.getenv("NHL_S3_PREFIX", "").strip("/")
+s3 = None
+if bucket:
+    import boto3
+    s3 = boto3.client("s3")
+
+# A single download function keeps retry, caching, and atomic writes consistent.
+# Missing historical endpoints (404) are recorded so they are not retried every night.
+counts = {"new": 0, "updated": 0, "cached": 0, "unavailable": 0, "failed": 0}
+failures = []
+download_limit_reached = False
+
+
+def get_json(url, path, params=None, refresh=False):
+    global download_limit_reached
+
+    # Skip archived data; refresh only requested recent records or explicit overwrites.
+    missing_marker = path.with_suffix(".unavailable")
+    if missing_marker.exists() and not args.overwrite:
+        counts["unavailable"] += 1
+        return None
+    if path.exists() and not (args.overwrite or refresh):
+        counts["cached"] += 1
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    # Bound the number of network downloads for safe initial testing.
+    if args.max_downloads and counts["new"] + counts["updated"] >= args.max_downloads:
+        download_limit_reached = True
+        return None
+
+    # Fetch the original response; treat unavailable historical endpoints separately.
+    try:
+        response = session.get(url, params=params, timeout=30)
+        if response.status_code == 404:
+            missing_marker.parent.mkdir(parents=True, exist_ok=True)
+            missing_marker.write_text(url + "\n", encoding="utf-8")
+            counts["unavailable"] += 1
+            return None
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        counts["failed"] += 1
+        failures.append(f"{path}: {error}")
+        return None
+
+    # Save completed JSON atomically to avoid treating interrupted downloads as complete.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data), encoding="utf-8")
+    temporary.replace(path)
+    counts["updated" if refresh or args.overwrite else "new"] += 1
+
+    # Upload newly saved source JSON when an AWS bucket is configured.
+    if s3:
+        key = "/".join(filter(None, [prefix, "raw-api-data", path.relative_to(RAW).as_posix()]))
+        try:
+            s3.upload_file(str(path), bucket, key)
+        except Exception as error:
+            counts["failed"] += 1
+            failures.append(f"S3 {key}: {error}")
+    time.sleep(0.05)
+    return data
+
+
+# Retrieve official season, team and reference catalogs before scheduling jobs.
+# Cached references are refreshed daily, because they discover new seasons and teams.
+references = {
+    "standings_seasons": f"{WEB}/standings-season",
+    "teams": f"{STATS}/team",
+    "franchises": f"{STATS}/franchise",
+    "seasons": f"{STATS}/season",
+    "component_seasons": f"{STATS}/componentSeason",
+    "countries": f"{STATS}/country",
+    "drafts": f"{STATS}/draft",
+    "glossary": f"{STATS}/glossary",
+    "stats_config": f"{STATS}/config",
+    "game_meta": f"{STATS}/game/meta",
+}
+reference_data = {}
+for name, url in references.items():
+    reference_data[name] = get_json(url, RAW / "reference" / f"{name}.json", refresh=True)
+
+# Build an all-history season list from the NHL season catalog, not a hardcoded year.
+# The season filter is useful when backfilling or testing one season.
+seasons_data = reference_data.get("seasons") or {}
+seasons = sorted({
+    str(row["id"]) for row in seasons_data.get("data", [])
+    if str(row.get("id", "")).isdigit() and len(str(row["id"])) == 8
+})
+if args.season_id:
+    seasons = [args.season_id]
+if not seasons:
+    raise RuntimeError("No NHL seasons discovered. Check the season reference endpoint.")
+
+# Generate the team abbreviation universe from the API, including historical clubs.
+# Fallback abbreviations supplement historical aliases that may not appear in the catalog.
+teams_data = reference_data.get("teams") or {}
+team_codes = {
+    str(row.get("triCode") or row.get("abbrev") or "").upper()
+    for row in teams_data.get("data", [])
+}
+team_codes |= {"ATL", "ARI", "PHX", "QUE", "HFD", "WIN", "MNS", "CLR", "KCS", "CLE"}
+team_codes = sorted(team for team in team_codes if len(team) == 3 and team.isalpha())
+
+# Discover game IDs using season schedules and retain the original schedule JSON.
+# Do not request future-game play-by-play or game reports.
+games = {}
+for season in seasons:
+    for team in team_codes:
+        if download_limit_reached:
+            break
+        url = f"{WEB}/club-schedule-season/{team}/{season}"
+        path = RAW / "schedules" / season / f"{team}.json"
+        schedule = get_json(url, path, refresh=season == seasons[-1]) or {}
+        for game in schedule.get("games", []):
+            if game.get("id"):
+                games[int(game["id"])] = {"season": season, **game}
+    if download_limit_reached:
+        break
+print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
+
+# Fetch the three NHL gamecenter feeds plus shift charts for played games.
+# Refresh recent games to capture NHL corrections or delayed statistics.
+game_endpoints = {
+    "play_by_play": "play-by-play",
+    "boxscore": "boxscore",
+    "landing": "landing",
+}
+for game_id, game in sorted(games.items()):
+    if download_limit_reached:
+        break
+    game_date = date.fromisoformat(game["gameDate"])
+    if game_date > today:
+        continue
+    refresh = game_date >= recent_cutoff
+    season = game["season"]
+    for name, endpoint in game_endpoints.items():
+        url = f"{WEB}/gamecenter/{game_id}/{endpoint}"
+        get_json(url, RAW / season / name / f"{game_id}.json", refresh=refresh)
+
+    # Request official shifts from the Stats REST endpoint for the same game.
+    params = {"cayenneExp": f"gameId={game_id}", "limit": -1}
+    get_json(f"{STATS}/shiftcharts", RAW / season / "shifts" / f"{game_id}.json",
+             params=params, refresh=refresh)
+
+# Discover season-team combinations and download rosters and club statistics.
+# Collect player IDs for player landing pages and season game logs.
+players = set()
+team_seasons = set()
+season_types = set()
+game_dates = set()
+for game in games.values():
+    season = game["season"]
+    season_types.add((season, int(game.get("gameType", 2))))
+    game_dates.add(game["gameDate"])
+    for side in ("homeTeam", "awayTeam"):
+        abbrev = (game.get(side) or {}).get("abbrev")
+        if abbrev:
+            team_seasons.add((season, abbrev))
+
+# Download rosters for teams that actually participated in each season.
+# The roster responses provide player identifiers for other API requests.
+for season, team in sorted(team_seasons):
+    if download_limit_reached:
+        break
+    url = f"{WEB}/roster/{team}/{season}"
+    roster = get_json(url, RAW / season / "rosters" / f"{team}.json") or {}
+    for group in ("forwards", "defensemen", "goalies"):
+        players.update(int(row["id"]) for row in roster.get(group, []) if row.get("id"))
+
+# Save player profiles once per player, independent of their seasons and teams.
+# Profiles are reference records; recent updates can be requested with --overwrite.
+for player_id in sorted(players):
+    if download_limit_reached:
+        break
+    get_json(f"{WEB}/player/{player_id}/landing", RAW / "players" / f"{player_id}.json")
+
+# Retrieve date-specific standings and per-team season aggregate statistics.
+# Each source remains raw JSON and is not combined with other endpoints here.
+for game_date in sorted(game_dates):
+    if download_limit_reached:
+        break
+    get_json(f"{WEB}/standings/{game_date}", RAW / "standings" / f"{game_date}.json",
+             refresh=date.fromisoformat(game_date) >= recent_cutoff)
+for season, team in sorted(team_seasons):
+    if download_limit_reached:
+        break
+    types = {kind for sid, kind in season_types if sid == season}
+    for kind in sorted(types):
+        url = f"{WEB}/club-stats/{team}/{season}/{kind}"
+        get_json(url, RAW / season / "club_stats" / str(kind) / f"{team}.json",
+                 refresh=season == seasons[-1])
+
+# Preserve season-specific player game logs for players on each season's rosters.
+# This avoids requesting the Cartesian product of every player and NHL season.
+for season, team in sorted(team_seasons):
+    if download_limit_reached:
+        break
+    roster_file = RAW / season / "rosters" / f"{team}.json"
+    if not roster_file.exists():
+        continue
+    roster = json.loads(roster_file.read_text(encoding="utf-8"))
+    season_players = {
+        int(row["id"]) for group in ("forwards", "defensemen", "goalies")
+        for row in roster.get(group, []) if row.get("id")
+    }
+    for kind in sorted({k for sid, k in season_types if sid == season}):
+        for player_id in sorted(season_players):
+            url = f"{WEB}/player/{player_id}/game-log/{season}/{kind}"
+            path = RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json"
+            get_json(url, path, refresh=season == seasons[-1])
+            if download_limit_reached:
+                break
+
+# Download playoff brackets and drafts for discovered seasons.
+# Missing brackets for seasons without playoffs are expected.
+for season in seasons:
+    if download_limit_reached:
+        break
+    year = season[-4:]
+    get_json(f"{WEB}/playoff-bracket/{year}", RAW / season / "playoffs" / "bracket.json")
+    for round_number in range(1, 8):
+        url = f"{WEB}/draft/picks/{year}/{round_number}"
+        get_json(url, RAW / season / "draft_picks" / f"round_{round_number}.json")
+
+# Download the configured Stats REST reports by season and game type.
+# The report families match those used by the existing NHL research warehouse.
+reports = {
+    "skater": ["summary", "bios", "faceoffpercentages", "faceoffwins", "goalsForAgainst",
+               "realtime", "penalties", "penaltykill", "penaltyShots", "powerplay",
+               "puckPossessions", "summaryshooting", "percentages", "scoringRates",
+               "scoringpergame", "shootout", "shottype", "timeonice"],
+    "goalie": ["summary", "advanced", "bios", "daysrest", "penaltyShots",
+               "savesByStrength", "shootout", "startedVsRelieved"],
+    "team": ["summary", "faceoffpercentages", "daysbetweengames", "faceoffwins",
+             "goalsagainstbystrength", "goalsbyperiod", "goalsforbystrength",
+             "leadingtrailing", "realtime", "outshootoutshotby", "penalties",
+             "penaltykill", "penaltykilltime", "powerplay", "powerplaytime",
+             "summaryshooting", "percentages", "scoretrailfirst", "shootout",
+             "shottype", "goalgames"],
+}
+for season, kind in sorted(season_types):
+    if download_limit_reached:
+        break
+    params = {"isAggregate": "false", "isGame": "false", "start": 0,
+              "limit": -1, "cayenneExp": f"seasonId={season} and gameTypeId={kind}"}
+    for entity, names in reports.items():
+        for name in names:
+            path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
+            get_json(f"{STATS}/{entity}/{name}", path, params=params,
+                     refresh=season == seasons[-1])
+            if download_limit_reached:
+                break
+
+# Report a concise summary and fail visibly if network or upload errors occurred.
+print(f"Download summary: {counts}")
+print(f"Request limit reached: {download_limit_reached}")
+if failures:
+    print("\n".join(failures[:25]))
+    raise RuntimeError(f"{len(failures)} downloads/uploads failed; rerun to retry.")
