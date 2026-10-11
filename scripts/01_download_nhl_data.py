@@ -31,6 +31,7 @@ session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=retry))
 today = date.today()
 recent_cutoff = today - timedelta(days=args.refresh_days)
+current_start_year = today.year if today.month >= 8 else today.year - 1
 
 # Optionally publish raw JSON to S3 using standard AWS credentials on either machine.
 # Local files remain the input for subsequent preparation scripts.
@@ -148,7 +149,7 @@ for season in seasons:
             break
         url = f"{WEB}/club-schedule-season/{team}/{season}"
         path = RAW / "schedules" / season / f"{team}.json"
-        schedule = get_json(url, path, refresh=season == seasons[-1]) or {}
+        schedule = get_json(url, path, refresh=season.startswith(str(current_start_year))) or {}
         for game in schedule.get("games", []):
             if game.get("id"):
                 games[int(game["id"])] = {"season": season, **game}
@@ -226,7 +227,7 @@ for season, team in sorted(team_seasons):
     for kind in sorted(types):
         url = f"{WEB}/club-stats/{team}/{season}/{kind}"
         get_json(url, RAW / season / "club_stats" / str(kind) / f"{team}.json",
-                 refresh=season == seasons[-1])
+                 refresh=season.startswith(str(current_start_year)))
 
 # Preserve season-specific player game logs for players on each season's rosters.
 # This avoids requesting the Cartesian product of every player and NHL season.
@@ -245,7 +246,7 @@ for season, team in sorted(team_seasons):
         for player_id in sorted(season_players):
             url = f"{WEB}/player/{player_id}/game-log/{season}/{kind}"
             path = RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json"
-            get_json(url, path, refresh=season == seasons[-1])
+            get_json(url, path, refresh=season.startswith(str(current_start_year)))
             if download_limit_reached:
                 break
 
@@ -285,7 +286,7 @@ for season, kind in sorted(season_types):
         for name in names:
             path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
             get_json(f"{STATS}/{entity}/{name}", path, params=params,
-                     refresh=season == seasons[-1])
+                     refresh=season.startswith(str(current_start_year)))
             if download_limit_reached:
                 break
 
