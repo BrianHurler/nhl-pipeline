@@ -100,7 +100,7 @@ def get_json(url, path, params=None, refresh=False):
         if response.status_code == 404:
             if not (args.overwrite or refresh):
                 missing_marker.parent.mkdir(parents=True, exist_ok=True)
-                missing_marker.write_text(url + "\\n", encoding="utf-8")
+                missing_marker.write_text(url + "\n", encoding="utf-8")
             counts["unavailable"] += 1
             return None
         response.raise_for_status()
