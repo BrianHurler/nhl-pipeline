@@ -25,6 +25,8 @@ parser.add_argument("--start-year", type=int, default=2016,
 parser.add_argument("--refresh-days", type=int, default=7)
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
+parser.add_argument("--games-only", action="store_true",
+                    help="Download gamecenter and shift-chart files; skip supplementary datasets")
 args = parser.parse_args()
 
 # Retry transient connection/server failures rather than saving incomplete responses.
@@ -246,7 +248,7 @@ completed_games = {
     and date.fromisoformat(game["gameDate"]) <= today
 }
 print(f"Completed games eligible for download: {len(completed_games):,}")
-for game_id, game in sorted(completed_games.items()):
+for game_number, (game_id, game) in enumerate(sorted(completed_games.items()), start=1):
     if download_limit_reached:
         break
     game_date = date.fromisoformat(game["gameDate"])
@@ -260,6 +262,21 @@ for game_id, game in sorted(completed_games.items()):
     params = {"cayenneExp": f"gameId={game_id}", "limit": -1}
     get_json(f"{STATS}/shiftcharts", RAW / season / "shifts" / f"{game_id}.json",
              params=params, refresh=refresh)
+
+    if game_number % 100 == 0 or game_number == len(completed_games):
+        print(f"Game progress: {game_number:,}/{len(completed_games):,} "
+              f"| new={counts['new']} cached={counts['cached']} "
+              f"unavailable={counts['unavailable']} failed={counts['failed']}", flush=True)
+
+# Run the game archive by itself before collecting supplementary datasets.
+# This makes a full-season pilot easier to validate and safely resume.
+if args.games_only:
+    print(f"Download summary: {counts}")
+    print(f"Request limit reached: {download_limit_reached}")
+    if failures:
+        print("\n".join(failures[:25]))
+        raise RuntimeError(f"{len(failures)} downloads/uploads failed; rerun to retry.")
+    raise SystemExit(0)
 
 # Discover season-team combinations and download rosters and club statistics.
 # Collect player IDs for player landing pages and season game logs.
