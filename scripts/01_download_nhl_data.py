@@ -70,8 +70,9 @@ def get_json(url, path, params=None, refresh=False):
     try:
         response = session.get(url, params=params, timeout=30)
         if response.status_code == 404:
-            missing_marker.parent.mkdir(parents=True, exist_ok=True)
-            missing_marker.write_text(url + "\n", encoding="utf-8")
+            if not refresh:
+                missing_marker.parent.mkdir(parents=True, exist_ok=True)
+                missing_marker.write_text(url + "\n", encoding="utf-8")
             counts["unavailable"] += 1
             return None
         response.raise_for_status()
