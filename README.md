@@ -15,31 +15,28 @@ Python data-engineering repository for collecting NHL API data, transforming it 
 nhl-pipeline/
 ├── README.md
 ├── AGENTS.md
-├── raw-api-data/
-│   └── .gitkeep
-└── aws-parquet-data/
-    └── .gitkeep
+├── run_all.py                # Master pipeline runner (planned)
+├── scripts/                  # Data acquisition and preparation scripts
+├── raw-api-data/             # Downloaded NHL API data
+└── aws-parquet-data/         # Generated Parquet datasets for AWS S3
 ```
 
-**`raw-api-data/`** will hold scripts for retrieving and organizing original NHL API responses.
+- **`run_all.py` (planned):** Top-level entry point to execute the pipeline scripts in order.
+- **`scripts/`:** Python scripts for downloading, processing, and publishing NHL datasets.
+- **`raw-api-data/`:** Local storage for original downloaded NHL API responses.
+- **`aws-parquet-data/`:** Local storage for generated Parquet datasets intended for AWS S3.
 
-**`aws-parquet-data/`** will hold scripts for processing NHL data into Parquet tables and publishing those tables to S3.
-
-These are the only two planned top-level *code folders*. They will hold scripts; large raw data and generated Parquet files should not be checked into Git.
+The two data directories are for data, not source code. Avoid committing large generated datasets or API archives to Git.
 
 ## Intended workflow
 
-1. Download raw NHL API responses.
-2. Parse and standardize fields into typed tables.
-3. Produce documented, analysis-ready Parquet datasets.
-4. Upload outputs to S3.
-5. Read these datasets from separate modeling and reporting repositories.
+1. Download NHL API responses into `raw-api-data/`.
+2. Parse and standardize source data into consistently typed tables.
+3. Build reusable, analysis-ready Parquet datasets in `aws-parquet-data/`.
+4. Publish Parquet outputs to AWS S3.
+5. Read the published datasets from separate modeling and reporting repositories.
 
-Previous pipeline work used `s3://nhl-data-bucket1/nhl-data-research/`. Final cloud paths will be reviewed during migration.
-
-## Status
-
-**Initial setup.** The directory placeholders and project coding guidelines are in place. No preparation scripts have been migrated or modified yet. The pipeline is not runnable from this repository yet.
+Earlier pipeline work used `s3://nhl-data-bucket1/nhl-data-research/`. Final cloud paths will be reviewed during script migration.
 
 ## Local setup
 
@@ -52,4 +49,4 @@ code .
 
 ## Development and security
 
-Follow [AGENTS.md](AGENTS.md): prioritize short, readable, mostly inline Python, with concise comments above logical blocks. Use AWS profiles or environment variables for credentials; never commit access keys, tokens, or local secret files.
+Follow [AGENTS.md](AGENTS.md): prioritize short, readable, mostly inline Python with concise comments above logical blocks. Use AWS profiles or environment variables for credentials; never commit access keys, tokens, or local secret files.
