@@ -191,19 +191,31 @@ for season in seasons:
 print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
 print("Game download test limit:", args.max_downloads or "unlimited")
 
-# Fetch the three NHL gamecenter feeds plus shift charts for played games.
-# Refresh recent games to capture NHL corrections or delayed statistics.
+# Count game states so scheduled and ongoing games remain visible in discovery.
+# Only OFF and FINAL games are eligible for completed-game API archives.
+game_states = {}
+for game in games.values():
+    state = game.get("gameState", "UNKNOWN")
+    game_states[state] = game_states.get(state, 0) + 1
+print("Discovered game states:", dict(sorted(game_states.items())))
+
+# Fetch the three gamecenter feeds and shift charts for completed games only.
+# Recent completed games are refreshed to capture corrections.
 game_endpoints = {
     "play_by_play": "play-by-play",
     "boxscore": "boxscore",
     "landing": "landing",
 }
-for game_id, game in sorted(games.items()):
+completed_games = {
+    game_id: game for game_id, game in games.items()
+    if game.get("gameState") in ("OFF", "FINAL")
+    and date.fromisoformat(game["gameDate"]) <= today
+}
+print(f"Completed games eligible for download: {len(completed_games):,}")
+for game_id, game in sorted(completed_games.items()):
     if download_limit_reached:
         break
     game_date = date.fromisoformat(game["gameDate"])
-    if game_date > today:
-        continue
     refresh = game_date >= recent_cutoff
     season = game["season"]
     for name, endpoint in game_endpoints.items():
@@ -221,10 +233,11 @@ players = set()
 team_seasons = set()
 season_types = set()
 game_dates = set()
-for game in games.values():
+for game_id, game in games.items():
     season = game["season"]
-    season_types.add((season, int(game.get("gameType", 2))))
-    game_dates.add(game["gameDate"])
+    if game_id in completed_games:
+        season_types.add((season, int(game.get("gameType", 2))))
+        game_dates.add(game["gameDate"])
     for side in ("homeTeam", "awayTeam"):
         abbrev = (game.get(side) or {}).get("abbrev")
         if abbrev:
