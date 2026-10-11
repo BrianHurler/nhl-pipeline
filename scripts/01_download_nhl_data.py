@@ -20,6 +20,8 @@ STATS = "https://api.nhle.com/stats/rest/en"
 # Select a historical season, limit a test run, or request a deliberate refresh.
 parser = argparse.ArgumentParser(description="Download missing NHL API JSON records.")
 parser.add_argument("--season-id", help="Optional eight-digit NHL season ID")
+parser.add_argument("--start-year", type=int, default=2016,
+                    help="First season start year for multi-season runs (default: 2016)")
 parser.add_argument("--refresh-days", type=int, default=7)
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
@@ -160,6 +162,8 @@ seasons = sorted({
 })
 if args.season_id:
     seasons = [args.season_id]
+else:
+    seasons = [season for season in seasons if int(season[:4]) >= args.start_year]
 if not seasons:
     raise RuntimeError("No NHL seasons discovered. Check the season reference endpoint.")
 
