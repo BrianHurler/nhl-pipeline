@@ -263,7 +263,7 @@ for game_number, (game_id, game) in enumerate(sorted(completed_games.items()), s
     get_json(f"{STATS}/shiftcharts", RAW / season / "shifts" / f"{game_id}.json",
              params=params, refresh=refresh)
 
-    if game_number % 100 == 0 or game_number == len(completed_games):
+    if game_number % 25 == 0 or game_number == len(completed_games):
         print(f"Game progress: {game_number:,}/{len(completed_games):,} "
               f"| new={counts['new']} cached={counts['cached']} "
               f"unavailable={counts['unavailable']} failed={counts['failed']}", flush=True)
