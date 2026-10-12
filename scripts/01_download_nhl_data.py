@@ -342,82 +342,86 @@ for index, (season, team) in enumerate(roster_jobs, start=1):
     if index % 25 == 0 or index == len(roster_jobs):
         print(f"Rosters: {index:,}/{len(roster_jobs):,} | {counts}", flush=True)
 
-# Save player profiles once per player, independent of their seasons and teams.
-# Profiles are reference records; recent updates can be requested with --overwrite.
-player_jobs = sorted(players)
-print(f"Stage: player profiles ({len(player_jobs):,} players)", flush=True)
-for index, player_id in enumerate(player_jobs, start=1):
-    if download_limit_reached:
-        break
-    get_json(f"{WEB}/player/{player_id}/landing", RAW / "players" / f"{player_id}.json")
-    if index % 100 == 0 or index == len(player_jobs):
-        print(f"Player profiles: {index:,}/{len(player_jobs):,} | {counts}", flush=True)
+# Reuse the game workers for independent supplementary API requests.
+# Rosters are downloaded first above because they supply the player IDs.
+def download_supplement(job):
+    url, path, params, refresh = job
+    get_json(url, path, params=params, refresh=refresh, read_data=False)
 
-# Retrieve date-specific standings and per-team season aggregate statistics.
-# Each source remains raw JSON and is not combined with other endpoints here.
-standings_jobs = sorted(game_dates)
-print(f"Stage: standings ({len(standings_jobs):,} dates)", flush=True)
-for index, game_date in enumerate(standings_jobs, start=1):
-    if download_limit_reached:
-        break
-    get_json(f"{WEB}/standings/{game_date}", RAW / "standings" / f"{game_date}.json",
-             refresh=date.fromisoformat(game_date) >= recent_cutoff)
-    if index % 25 == 0 or index == len(standings_jobs):
-        print(f"Standings: {index:,}/{len(standings_jobs):,} | {counts}", flush=True)
 
-club_jobs = sorted(team_seasons)
-print(f"Stage: club statistics ({len(club_jobs):,} team-seasons)", flush=True)
-for index, (season, team) in enumerate(club_jobs, start=1):
-    if download_limit_reached:
-        break
-    types = {kind for sid, kind in season_types if sid == season}
-    for kind in sorted(types):
-        url = f"{WEB}/club-stats/{team}/{season}/{kind}"
-        get_json(url, RAW / season / "club_stats" / str(kind) / f"{team}.json",
-                 refresh=season.startswith(str(current_start_year)))
-    if index % 25 == 0 or index == len(club_jobs):
-        print(f"Club statistics: {index:,}/{len(club_jobs):,} | {counts}", flush=True)
+# Each stage prints progress while preserving the same shared S3 cache.
+def run_stage(label, jobs, interval=100):
+    print(f"Stage: {label} ({len(jobs):,} requests; {workers} workers)", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(download_supplement, job) for job in jobs]
+        for index, future in enumerate(as_completed(futures), start=1):
+            future.result()
+            if index % interval == 0 or index == len(jobs):
+                print(f"{label}: {index:,}/{len(jobs):,} | {counts}", flush=True)
 
-# Preserve season-specific player game logs for players on each season's rosters.
-# This avoids requesting the Cartesian product of every player and NHL season.
-log_jobs = sorted(team_seasons)
-print(f"Stage: player game logs ({len(log_jobs):,} team-seasons)", flush=True)
-for index, (season, team) in enumerate(log_jobs, start=1):
-    if download_limit_reached:
-        break
+
+# Player profiles are shared across seasons and only need one request per player.
+profile_jobs = [
+    (f"{WEB}/player/{player_id}/landing", RAW / "players" / f"{player_id}.json", None, False)
+    for player_id in sorted(players)
+]
+run_stage("Player profiles", profile_jobs)
+
+# Standings are keyed by date; refresh only the most recent dates.
+standings_jobs = [
+    (f"{WEB}/standings/{day}", RAW / "standings" / f"{day}.json",
+     None, date.fromisoformat(day) >= recent_cutoff)
+    for day in sorted(game_dates)
+]
+run_stage("Standings", standings_jobs, interval=25)
+
+# Retrieve each team and game-type combination once per season.
+club_jobs = [
+    (f"{WEB}/club-stats/{team}/{season}/{kind}",
+     RAW / season / "club_stats" / str(kind) / f"{team}.json",
+     None, season.startswith(str(current_start_year)))
+    for season, team in sorted(team_seasons)
+    for kind in sorted(k for sid, k in season_types if sid == season)
+]
+run_stage("Club statistics", club_jobs)
+
+# Read cached rosters and create distinct player-season-game-type requests.
+# A player appearing on multiple team rosters should not be downloaded twice.
+log_jobs = set()
+for season, team in sorted(team_seasons):
     roster_file = RAW / season / "rosters" / f"{team}.json"
     if not roster_file.exists():
         continue
     roster = json.loads(roster_file.read_text(encoding="utf-8"))
-    season_players = {
+    player_ids = {
         int(row["id"]) for group in ("forwards", "defensemen", "goalies")
         for row in roster.get(group, []) if row.get("id")
     }
-    for kind in sorted({k for sid, k in season_types if sid == season}):
-        for player_id in sorted(season_players):
-            url = f"{WEB}/player/{player_id}/game-log/{season}/{kind}"
-            path = RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json"
-            get_json(url, path, refresh=season.startswith(str(current_start_year)))
-            if download_limit_reached:
-                break
-    if index % 5 == 0 or index == len(log_jobs):
-        print(f"Player game logs: {index:,}/{len(log_jobs):,} teams | {counts}", flush=True)
+    for kind in (k for sid, k in season_types if sid == season):
+        log_jobs.update((season, kind, player_id) for player_id in player_ids)
 
-# Download playoff brackets and drafts for discovered seasons.
-# Missing brackets for seasons without playoffs are expected.
-print(f"Stage: playoff brackets and drafts ({len(seasons):,} seasons)", flush=True)
-for index, season in enumerate(seasons, start=1):
-    if download_limit_reached:
-        break
+# Download player game logs in parallel after the roster inventory is complete.
+log_requests = [
+    (f"{WEB}/player/{player_id}/game-log/{season}/{kind}",
+     RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json",
+     None, season.startswith(str(current_start_year)))
+    for season, kind, player_id in sorted(log_jobs)
+]
+run_stage("Player game logs", log_requests, interval=100)
+
+# Preserve draft picks and playoff brackets for each requested season.
+draft_jobs = []
+for season in seasons:
     year = season[-4:]
-    get_json(f"{WEB}/playoff-bracket/{year}", RAW / season / "playoffs" / "bracket.json")
+    draft_jobs.append((f"{WEB}/playoff-bracket/{year}",
+                       RAW / season / "playoffs" / "bracket.json", None, False))
     for round_number in range(1, 8):
-        url = f"{WEB}/draft/picks/{year}/{round_number}"
-        get_json(url, RAW / season / "draft_picks" / f"round_{round_number}.json")
-    print(f"Playoffs and drafts: {index:,}/{len(seasons):,} | {counts}", flush=True)
+        draft_jobs.append((f"{WEB}/draft/picks/{year}/{round_number}",
+                           RAW / season / "draft_picks" / f"round_{round_number}.json",
+                           None, False))
+run_stage("Playoffs and drafts", draft_jobs)
 
-# Download the configured Stats REST reports by season and game type.
-# The report families match those used by the existing NHL research warehouse.
+# Keep the original statistics-report families from the research warehouse.
 reports = {
     "skater": ["summary", "bios", "faceoffpercentages", "faceoffwins", "goalsForAgainst",
                "realtime", "penalties", "penaltykill", "penaltyShots", "powerplay",
@@ -432,21 +436,18 @@ reports = {
              "summaryshooting", "percentages", "scoretrailfirst", "shootout",
              "shottype", "goalgames"],
 }
-report_jobs = sorted(season_types)
-print(f"Stage: statistical reports ({len(report_jobs):,} season/game-type groups)", flush=True)
-for index, (season, kind) in enumerate(report_jobs, start=1):
-    if download_limit_reached:
-        break
+
+# Prepare all season, game-type and report combinations for the worker pool.
+report_jobs = []
+for season, kind in sorted(season_types):
     params = {"isAggregate": "false", "isGame": "false", "start": 0,
               "limit": -1, "cayenneExp": f"seasonId={season} and gameTypeId={kind}"}
     for entity, names in reports.items():
         for name in names:
             path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
-            get_json(f"{STATS}/{entity}/{name}", path, params=params,
-                     refresh=season.startswith(str(current_start_year)))
-            if download_limit_reached:
-                break
-    print(f"Statistical reports: {index:,}/{len(report_jobs):,} | {counts}", flush=True)
+            report_jobs.append((f"{STATS}/{entity}/{name}", path, params,
+                                season.startswith(str(current_start_year))))
+run_stage("Statistical reports", report_jobs)
 
 # Report a concise summary and fail visibly if network or upload errors occurred.
 print(f"Download summary: {counts}")
