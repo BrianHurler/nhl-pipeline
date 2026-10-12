@@ -28,11 +28,14 @@ print(f"Reading {len(paths):,} local game files.")
 # Flatten the basic fields while keeping source-specific event details intact.
 # game_id and event_id together identify an event in a game.
 records = []
+empty_game_ids = []
 for path in paths:
     game_id = int(path.stem)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data.get("plays"), list):
         raise ValueError(f"Missing plays list in {path}")
+    if not data["plays"]:
+        empty_game_ids.append(game_id)
 
     for play in data["plays"]:
         period = play.get("periodDescriptor") or {}
@@ -86,5 +89,8 @@ target.parent.mkdir(parents=True, exist_ok=True)
 result.to_parquet(target, index=False)
 
 # Summarize the source coverage and resulting events.
-print(f"Wrote {len(result):,} plays from {len(paths):,} games to {target}")
+print(f"Wrote {len(result):,} plays from {len(paths) - len(empty_game_ids):,} games to {target}")
+print(f"Game files checked: {len(paths):,}; empty play feeds: {len(empty_game_ids):,}")
+if empty_game_ids:
+    print(f"Game IDs with no plays: {sorted(empty_game_ids)}")
 print(result["event_type"].value_counts().head(10).to_string())
