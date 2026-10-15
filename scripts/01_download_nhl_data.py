@@ -23,11 +23,12 @@ STATS = "https://api.nhle.com/stats/rest/en"
 parser = argparse.ArgumentParser(description="Download missing NHL API JSON records.")
 parser.add_argument("--season-id", help="Optional eight-digit NHL season ID")
 parser.add_argument("--nightly", action="store_true",
-                    help="Check last 180 days and archive files missing from S3")
+                    help="Find missing files across 180 days and refresh recent records")
 parser.add_argument("--lookback-days", type=int, default=180)
 parser.add_argument("--start-year", type=int, default=2016,
                     help="First season start year for multi-season runs (default: 2016)")
-parser.add_argument("--refresh-days", type=int, default=7)
+parser.add_argument("--refresh-days", type=int, default=14,
+                    help="Refresh last N days of games and relevant reports (default: 14)")
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
 parser.add_argument("--max-games", type=int, default=0,
@@ -40,9 +41,13 @@ args = parser.parse_args()
 if args.nightly and args.season_id:
     parser.error("--nightly cannot be combined with --season-id")
 if args.nightly and args.overwrite:
-    parser.error("--nightly is missing-only and cannot be combined with --overwrite")
+    parser.error("--nightly cannot be combined with --overwrite")
 if args.lookback_days < 1:
     parser.error("--lookback-days must be positive")
+if args.refresh_days < 1:
+    parser.error("--refresh-days must be positive")
+if args.nightly and args.refresh_days > args.lookback_days:
+    parser.error("--refresh-days must not exceed --lookback-days")
 
 # Retry transient connection/server failures rather than saving incomplete responses.
 retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -54,7 +59,7 @@ current_start_year = today.year if today.month >= 8 else today.year - 1
 nightly_cutoff = today - timedelta(days=args.lookback_days)
 cutoff_start_year = nightly_cutoff.year if nightly_cutoff.month >= 8 else nightly_cutoff.year - 1
 if args.nightly:
-    print(f"Nightly mode: checking {nightly_cutoff} through {today}", flush=True)
+    print(f"Nightly mode: checking {nightly_cutoff} through {today}; refresh since {recent_cutoff}", flush=True)
 
 # Require an S3 destination so downloaded raw records are durably archived.
 # Boto3 uses your local AWS profile or EC2 instance role for authentication.
@@ -288,11 +293,19 @@ completed_games = {
     and date.fromisoformat(game["gameDate"]) <= today
 }
 print(f"Completed games eligible for download: {len(completed_games):,}")
+
+# Season-level statistics are refreshed when that season has a game in the last 14 days.
+recent_seasons = {
+    game["season"] for game in completed_games.values()
+    if date.fromisoformat(game["gameDate"]) >= recent_cutoff
+}
+if args.nightly:
+    print(f"Seasons with recently completed games: {sorted(recent_seasons)}", flush=True)
 # Workers process separate games; a small download-limit test stays sequential.
 def download_game(item):
     game_id, game = item
     game_date = date.fromisoformat(game["gameDate"])
-    refresh = not args.nightly and game_date >= recent_cutoff
+    refresh = game_date >= recent_cutoff
     season = game["season"]
 
     for name, endpoint in game_endpoints.items():
@@ -393,7 +406,7 @@ run_stage("Player profiles", profile_jobs)
 # Standings are keyed by date; refresh only the most recent dates.
 standings_jobs = [
     (f"{WEB}/standings/{day}", RAW / "standings" / f"{day}.json",
-     None, not args.nightly and date.fromisoformat(day) >= recent_cutoff)
+     None, date.fromisoformat(day) >= recent_cutoff)
     for day in sorted(game_dates)
 ]
 run_stage("Standings", standings_jobs, interval=25)
@@ -402,7 +415,7 @@ run_stage("Standings", standings_jobs, interval=25)
 club_jobs = [
     (f"{WEB}/club-stats/{team}/{season}/{kind}",
      RAW / season / "club_stats" / str(kind) / f"{team}.json",
-     None, not args.nightly and season.startswith(str(current_start_year)))
+     None, (season in recent_seasons if args.nightly else season.startswith(str(current_start_year))))
     for season, team in sorted(team_seasons)
     for kind in sorted(k for sid, k in season_types if sid == season)
 ]
@@ -427,7 +440,7 @@ for season, team in sorted(team_seasons):
 log_requests = [
     (f"{WEB}/player/{player_id}/game-log/{season}/{kind}",
      RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json",
-     None, not args.nightly and season.startswith(str(current_start_year)))
+     None, (season in recent_seasons if args.nightly else season.startswith(str(current_start_year))))
     for season, kind, player_id in sorted(log_jobs)
 ]
 run_stage("Player game logs", log_requests, interval=100)
@@ -470,7 +483,7 @@ for season, kind in sorted(season_types):
         for name in names:
             path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
             report_jobs.append((f"{STATS}/{entity}/{name}", path, params,
-                                not args.nightly and season.startswith(str(current_start_year))))
+                                (season in recent_seasons if args.nightly else season.startswith(str(current_start_year))))
 run_stage("Statistical reports", report_jobs)
 
 # Report a concise summary and fail visibly if network or upload errors occurred.
