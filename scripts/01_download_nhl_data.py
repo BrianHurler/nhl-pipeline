@@ -22,6 +22,9 @@ STATS = "https://api.nhle.com/stats/rest/en"
 # Select a historical season, limit a test run, or request a deliberate refresh.
 parser = argparse.ArgumentParser(description="Download missing NHL API JSON records.")
 parser.add_argument("--season-id", help="Optional eight-digit NHL season ID")
+parser.add_argument("--nightly", action="store_true",
+                    help="Check last 180 days and archive files missing from S3")
+parser.add_argument("--lookback-days", type=int, default=180)
 parser.add_argument("--start-year", type=int, default=2016,
                     help="First season start year for multi-season runs (default: 2016)")
 parser.add_argument("--refresh-days", type=int, default=7)
@@ -34,6 +37,10 @@ parser.add_argument("--workers", type=int, default=4,
 parser.add_argument("--games-only", action="store_true",
                     help="Download gamecenter and shift-chart files; skip supplementary datasets")
 args = parser.parse_args()
+if args.nightly and args.season_id:
+    parser.error("--nightly cannot be combined with --season-id")
+if args.lookback_days < 1:
+    parser.error("--lookback-days must be positive")
 
 # Retry transient connection/server failures rather than saving incomplete responses.
 retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -42,6 +49,10 @@ session.mount("https://", HTTPAdapter(max_retries=retry))
 today = date.today()
 recent_cutoff = today - timedelta(days=args.refresh_days)
 current_start_year = today.year if today.month >= 8 else today.year - 1
+nightly_cutoff = today - timedelta(days=args.lookback_days)
+cutoff_start_year = nightly_cutoff.year if nightly_cutoff.month >= 8 else nightly_cutoff.year - 1
+if args.nightly:
+    print(f"Nightly mode: checking {nightly_cutoff} through {today}", flush=True)
 
 # Require an S3 destination so downloaded raw records are durably archived.
 # Boto3 uses your local AWS profile or EC2 instance role for authentication.
@@ -182,6 +193,9 @@ seasons = sorted({
 })
 if args.season_id:
     seasons = [args.season_id]
+elif args.nightly:
+    seasons = [season for season in seasons
+               if cutoff_start_year <= int(season[:4]) <= current_start_year]
 else:
     seasons = [season for season in seasons if int(season[:4]) >= args.start_year]
 if not seasons:
@@ -206,7 +220,7 @@ for season in seasons:
         params = {"cayenneExp": f"season={season}", "start": start, "limit": page_size}
         path = RAW / "game_catalog" / season / f"page_{start}.json"
         catalog = get_json(f"{STATS}/game", path, params=params,
-                           refresh=season.startswith(str(current_start_year)),
+                           refresh=args.nightly or season.startswith(str(current_start_year)),
                            count_limit=False)
         if not isinstance(catalog, dict) or not isinstance(catalog.get("data"), list):
             raise RuntimeError(f"Missing or unexpected NHL game catalog for {season}, page {start}")
@@ -244,6 +258,12 @@ for season in seasons:
     print(f"{season}: {season_games:,} league-wide game records discovered.")
 
 print(f"Discovered {len(games):,} unique games in {len(seasons)} requested seasons.")
+
+# Limit nightly file requests to games within the rolling calendar-day window.
+if args.nightly:
+    games = {game_id: game for game_id, game in games.items()
+             if nightly_cutoff <= date.fromisoformat(game["gameDate"]) <= today}
+    print(f"Games within nightly window: {len(games):,}", flush=True)
 print("Game download test limit:", args.max_downloads or "unlimited")
 
 # Game state IDs 6 and 7 represent completed games in the Stats REST feed.
@@ -270,7 +290,7 @@ print(f"Completed games eligible for download: {len(completed_games):,}")
 def download_game(item):
     game_id, game = item
     game_date = date.fromisoformat(game["gameDate"])
-    refresh = game_date >= recent_cutoff
+    refresh = not args.nightly and game_date >= recent_cutoff
     season = game["season"]
 
     for name, endpoint in game_endpoints.items():
@@ -336,7 +356,8 @@ for index, (season, team) in enumerate(roster_jobs, start=1):
     if download_limit_reached:
         break
     url = f"{WEB}/roster/{team}/{season}"
-    roster = get_json(url, RAW / season / "rosters" / f"{team}.json") or {}
+    roster = get_json(url, RAW / season / "rosters" / f"{team}.json",
+                      refresh=args.nightly) or {}
     for group in ("forwards", "defensemen", "goalies"):
         players.update(int(row["id"]) for row in roster.get(group, []) if row.get("id"))
     if index % 25 == 0 or index == len(roster_jobs):
@@ -370,7 +391,7 @@ run_stage("Player profiles", profile_jobs)
 # Standings are keyed by date; refresh only the most recent dates.
 standings_jobs = [
     (f"{WEB}/standings/{day}", RAW / "standings" / f"{day}.json",
-     None, date.fromisoformat(day) >= recent_cutoff)
+     None, not args.nightly and date.fromisoformat(day) >= recent_cutoff)
     for day in sorted(game_dates)
 ]
 run_stage("Standings", standings_jobs, interval=25)
@@ -379,7 +400,7 @@ run_stage("Standings", standings_jobs, interval=25)
 club_jobs = [
     (f"{WEB}/club-stats/{team}/{season}/{kind}",
      RAW / season / "club_stats" / str(kind) / f"{team}.json",
-     None, season.startswith(str(current_start_year)))
+     None, not args.nightly and season.startswith(str(current_start_year)))
     for season, team in sorted(team_seasons)
     for kind in sorted(k for sid, k in season_types if sid == season)
 ]
@@ -404,7 +425,7 @@ for season, team in sorted(team_seasons):
 log_requests = [
     (f"{WEB}/player/{player_id}/game-log/{season}/{kind}",
      RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json",
-     None, season.startswith(str(current_start_year)))
+     None, not args.nightly and season.startswith(str(current_start_year)))
     for season, kind, player_id in sorted(log_jobs)
 ]
 run_stage("Player game logs", log_requests, interval=100)
@@ -419,7 +440,8 @@ for season in seasons:
         draft_jobs.append((f"{WEB}/draft/picks/{year}/{round_number}",
                            RAW / season / "draft_picks" / f"round_{round_number}.json",
                            None, False))
-run_stage("Playoffs and drafts", draft_jobs)
+if not args.nightly:
+    run_stage("Playoffs and drafts", draft_jobs)
 
 # Keep the original statistics-report families from the research warehouse.
 reports = {
@@ -446,7 +468,7 @@ for season, kind in sorted(season_types):
         for name in names:
             path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
             report_jobs.append((f"{STATS}/{entity}/{name}", path, params,
-                                season.startswith(str(current_start_year))))
+                                not args.nightly and season.startswith(str(current_start_year))))
 run_stage("Statistical reports", report_jobs)
 
 # Report a concise summary and fail visibly if network or upload errors occurred.
