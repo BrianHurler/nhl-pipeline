@@ -483,7 +483,7 @@ for season, kind in sorted(season_types):
         for name in names:
             path = RAW / season / "stats_reports" / str(kind) / entity / f"{name}.json"
             report_jobs.append((f"{STATS}/{entity}/{name}", path, params,
-                                (season in recent_seasons if args.nightly else season.startswith(str(current_start_year))))
+                                (season in recent_seasons if args.nightly else season.startswith(str(current_start_year)))))
 run_stage("Statistical reports", report_jobs)
 
 # Report a concise summary and fail visibly if network or upload errors occurred.
