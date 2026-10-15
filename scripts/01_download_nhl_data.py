@@ -39,6 +39,8 @@ parser.add_argument("--games-only", action="store_true",
 args = parser.parse_args()
 if args.nightly and args.season_id:
     parser.error("--nightly cannot be combined with --season-id")
+if args.nightly and args.overwrite:
+    parser.error("--nightly is missing-only and cannot be combined with --overwrite")
 if args.lookback_days < 1:
     parser.error("--lookback-days must be positive")
 
