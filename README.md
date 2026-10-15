@@ -57,16 +57,18 @@ This is the target architecture; implementation will proceed as the existing pre
 
 ## Nightly raw-data ingestion
 
-Run the downloader in **nightly mode** on EC2 after the historical S3 backfill:
+Use `--nightly` on EC2 after the historical S3 backfill:
 
 ```bash
 python -u scripts/01_download_nhl_data.py --nightly --workers 8
 ```
 
-- Searches the league-wide NHL game catalogs for seasons overlapping the **last 180 calendar days** (configurable with `--lookback-days`). It downloads gamecenter and shift-chart feeds only for completed games in that date window.
-- Compares expected object keys with the existing S3 archive. Already archived game data and supplementary records are skipped, while missing files are downloaded and uploaded.
-- Refreshes the small league-wide reference catalogs and participating-team rosters to discover newly available games and players. It otherwise uses a **missing-only** policy; corrections to previously archived game feeds or season statistics are **not** refreshed automatically in nightly mode.
-- Limits supplementary jobs (players, standings, club stats, logs and reports) to participating teams, season types, and game dates in that window. Historical drafts/playoff bracket backfill remains part of the regular mode.
-- Leaves the historical backfill unchanged: run `python -u scripts/01_download_nhl_data.py --start-year 2016 --workers 8` without `--nightly` when intentionally scanning every season.
+- **180-day gap check:** Scan league-wide game catalogs for seasons overlapping the last 180 calendar days (`--lookback-days`). Download any missing completed-game feeds, shifts, and relevant supporting files, comparing against the S3 object inventory.
+- **14-day corrections refresh:** Re-download play-by-play, box scores, gamecenter landing pages and shifts for completed games from the past 14 days (`--refresh-days 14`, the default). Also refresh standings for recent game dates.
+- **Season-to-date statistics:** Refresh player game logs, club statistics and statistical reports for seasons with a completed game in the last 14 days. This includes previously archived files, since their cumulative contents may change after each game.
+- **Player/roster discovery:** Refresh participating-team rosters each nightly run; fetch missing player profiles. Refresh game catalogs and small reference records for discovery.
+- **Historical runs:** Omitting `--nightly` preserves the full backfill behavior. Draft picks and playoff brackets remain part of historical mode rather than the nightly job.
 
-The downloader requires `NHL_S3_BUCKET` and supports an optional `NHL_S3_PREFIX`; on EC2, use an attached instance IAM role instead of static AWS keys. Schedule only after verifying the nightly command and failure logs interactively. Parquet transformation and publishing will be added to the nightly orchestrator separately.
+The downloader requires `NHL_S3_BUCKET` and supports optional `NHL_S3_PREFIX`. Use an EC2 instance IAM role instead of static keys. Validate the nightly download and failure logs before scheduling it. Parquet transformations and publishing will be integrated into a separate orchestration step.
+
+**Trade-off:** The 14-day correction window does not catch source changes made later than that. Season statistics can also require more requests during an active season; measure the nightly runtime on EC2 before scheduling.
