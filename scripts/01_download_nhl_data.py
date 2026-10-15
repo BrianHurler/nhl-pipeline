@@ -327,6 +327,7 @@ if args.max_games:
     game_items = game_items[:args.max_games]
 workers = 1 if args.max_downloads else max(1, args.workers)
 print(f"Processing {len(game_items):,} games with {workers} worker(s).", flush=True)
+game_stage_start = time.perf_counter()
 with ThreadPoolExecutor(max_workers=workers) as executor:
     futures = [executor.submit(download_game, item) for item in game_items]
     for game_number, future in enumerate(as_completed(futures), start=1):
@@ -336,6 +337,43 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
                   f"| new={counts['new']} cached={counts['cached']} "
                   f"unavailable={counts['unavailable']} failed={counts['failed']}",
                   flush=True)
+
+print(f"Game stage finished in {(time.perf_counter() - game_stage_start) / 60:.1f} minutes.", flush=True)
+
+# Read fresh box scores to find players who participated in recently completed games.
+# If any recent box score is missing or lacks player groups, refresh all season logs safely.
+recent_players = {}
+fallback_seasons = set()
+if args.nightly and not args.games_only:
+    recent_games = [
+        game for game in completed_games.values()
+        if date.fromisoformat(game["gameDate"]) >= recent_cutoff
+    ]
+    for game in recent_games:
+        season = game["season"]
+        box_file = RAW / season / "boxscore" / f"{game['id']}.json"
+        try:
+            box = json.loads(box_file.read_text(encoding="utf-8"))
+            teams = box["playerByGameStats"]
+            if not all(isinstance(teams[side], dict) for side in ("homeTeam", "awayTeam")):
+                raise ValueError("Missing player-by-game team groups")
+            players_in_game = set()
+            for side in ("homeTeam", "awayTeam"):
+                for group in ("forwards", "defense", "goalies"):
+                    members = teams[side].get(group)
+                    if not isinstance(members, list):
+                        raise ValueError(f"Missing or invalid {side} {group}")
+                    players_in_game.update(int(row["playerId"]) for row in members)
+            if not players_in_game:
+                raise ValueError("Empty box score player inventory")
+            recent_players.setdefault(season, set()).update(players_in_game)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            fallback_seasons.add(season)
+            print(f"Box score {game['id']} not usable ({error}); "
+                  f"using complete player-log refresh for {season}.", flush=True)
+    print(f"Recent participants: "
+          f"{ {season: len(ids) for season, ids in sorted(recent_players.items())} }; "
+          f"fallback seasons: {sorted(fallback_seasons)}", flush=True)
 
 # Run the game archive by itself before collecting supplementary datasets.
 # This makes a full-season pilot easier to validate and safely resume.
@@ -366,6 +404,7 @@ for game_id, game in games.items():
 # Download rosters for teams that actually participated in each season.
 # The roster responses provide player identifiers for other API requests.
 roster_jobs = sorted(team_seasons)
+roster_stage_start = time.perf_counter()
 print(f"Stage: rosters ({len(roster_jobs):,} team-seasons)", flush=True)
 for index, (season, team) in enumerate(roster_jobs, start=1):
     if download_limit_reached:
@@ -377,6 +416,7 @@ for index, (season, team) in enumerate(roster_jobs, start=1):
         players.update(int(row["id"]) for row in roster.get(group, []) if row.get("id"))
     if index % 25 == 0 or index == len(roster_jobs):
         print(f"Rosters: {index:,}/{len(roster_jobs):,} | {counts}", flush=True)
+print(f"Rosters elapsed: {(time.perf_counter() - roster_stage_start) / 60:.1f} minutes.", flush=True)
 
 # Reuse the game workers for independent supplementary API requests.
 # Rosters are downloaded first above because they supply the player IDs.
@@ -387,6 +427,8 @@ def download_supplement(job):
 
 # Each stage prints progress while preserving the same shared S3 cache.
 def run_stage(label, jobs, interval=100):
+    stage_start = time.perf_counter()
+    counts_before = counts.copy()
     print(f"Stage: {label} ({len(jobs):,} requests; {workers} workers)", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(download_supplement, job) for job in jobs]
@@ -394,6 +436,9 @@ def run_stage(label, jobs, interval=100):
             future.result()
             if index % interval == 0 or index == len(jobs):
                 print(f"{label}: {index:,}/{len(jobs):,} | {counts}", flush=True)
+    differences = {name: counts[name] - counts_before[name] for name in counts}
+    print(f"{label} finished in {(time.perf_counter() - stage_start) / 60:.1f} minutes "
+          f"| stage counts: {differences}", flush=True)
 
 
 # Player profiles are shared across seasons and only need one request per player.
@@ -436,13 +481,28 @@ for season, team in sorted(team_seasons):
     for kind in (k for sid, k in season_types if sid == season):
         log_jobs.update((season, kind, player_id) for player_id in player_ids)
 
+# For nightly runs, refresh only recent participants' season-to-date game logs.
+# Any missing archived player log is still downloaded by get_json, regardless of refresh.
+# When a recent box score cannot be parsed, refresh all logs for that season as a fallback.
+def refresh_player_log(season, player_id):
+    if not args.nightly:
+        return season.startswith(str(current_start_year))
+    if season not in recent_seasons:
+        return False
+    return season in fallback_seasons or player_id in recent_players.get(season, set())
+
+
 # Download player game logs in parallel after the roster inventory is complete.
 log_requests = [
     (f"{WEB}/player/{player_id}/game-log/{season}/{kind}",
      RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json",
-     None, (season in recent_seasons if args.nightly else season.startswith(str(current_start_year))))
+     None, refresh_player_log(season, player_id))
     for season, kind, player_id in sorted(log_jobs)
 ]
+if args.nightly:
+    selected = sum(refresh for _, _, _, refresh in log_requests)
+    print(f"Player game logs: refreshing {selected:,} recent-participant combinations; "
+          f"checking {len(log_requests):,} for missing files.", flush=True)
 run_stage("Player game logs", log_requests, interval=100)
 
 # Preserve draft picks and playoff brackets for each requested season.
