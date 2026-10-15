@@ -54,3 +54,19 @@ The pipeline will use **Python + DuckDB + Parquet + AWS S3** to maintain reusabl
 - **Scope:** Remove exploratory analyses and redundant QA from the production pipeline, while retaining essential checks that prevent silent data corruption or loss. Downstream models and reporting belong in separate repositories.
 
 This is the target architecture; implementation will proceed as the existing preparation scripts are reviewed and migrated.
+
+## Nightly raw-data ingestion
+
+Run the downloader in **nightly mode** on EC2 after the historical S3 backfill:
+
+```bash
+python -u scripts/01_download_nhl_data.py --nightly --workers 8
+```
+
+- Searches the league-wide NHL game catalogs for seasons overlapping the **last 180 calendar days** (configurable with `--lookback-days`). It downloads gamecenter and shift-chart feeds only for completed games in that date window.
+- Compares expected object keys with the existing S3 archive. Already archived game data and supplementary records are skipped, while missing files are downloaded and uploaded.
+- Refreshes the small league-wide reference catalogs and participating-team rosters to discover newly available games and players. It otherwise uses a **missing-only** policy; corrections to previously archived game feeds or season statistics are **not** refreshed automatically in nightly mode.
+- Limits supplementary jobs (players, standings, club stats, logs and reports) to participating teams, season types, and game dates in that window. Historical drafts/playoff bracket backfill remains part of the regular mode.
+- Leaves the historical backfill unchanged: run `python -u scripts/01_download_nhl_data.py --start-year 2016 --workers 8` without `--nightly` when intentionally scanning every season.
+
+The downloader requires `NHL_S3_BUCKET` and supports an optional `NHL_S3_PREFIX`; on EC2, use an attached instance IAM role instead of static AWS keys. Schedule only after verifying the nightly command and failure logs interactively. Parquet transformation and publishing will be added to the nightly orchestrator separately.
