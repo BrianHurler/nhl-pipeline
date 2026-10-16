@@ -64,7 +64,7 @@ python -u scripts/01_download_nhl_data.py --nightly --workers 8
 ```
 
 - **180-day gap check:** Scan league-wide game catalogs for seasons overlapping the last 180 calendar days (`--lookback-days`). Download any missing completed-game feeds, shifts, and relevant supporting files, comparing against the S3 object inventory.
-- **14-day corrections refresh:** Re-download play-by-play, box scores, gamecenter landing pages and shifts for completed games from the past 14 days (`--refresh-days 14`, the default). Also refresh standings for recent game dates.
+- **7-day corrections refresh:** Re-download play-by-play, box scores, gamecenter landing pages and shifts for completed games from the past 7 days (`--refresh-days 7`, the default). Also refresh standings for recent game dates.
 - **Player game logs:** Refresh season-to-date logs only for players found in completed-game box scores from the last 14 days. Check other roster-derived player-log keys against S3 and download any missing files. If a recent box score is missing or malformed, conservatively refresh all logs for that season.
 - **Season-to-date statistics:** Refresh club statistics and statistical reports for seasons with a completed game in the last 14 days, since their cumulative contents change throughout the season.
 - **Player/roster discovery:** Refresh participating-team rosters each nightly run; fetch missing player profiles. Refresh game catalogs and small reference records for discovery.
@@ -72,4 +72,4 @@ python -u scripts/01_download_nhl_data.py --nightly --workers 8
 
 The downloader requires `NHL_S3_BUCKET` and supports optional `NHL_S3_PREFIX`. Use an EC2 instance IAM role instead of static keys. The script prints elapsed minutes and result counts for each supplementary stage, plus game-stage timing. Validate the nightly download and failure logs before scheduling it. Parquet transformations and publishing will be integrated into a separate orchestration step.
 
-**Trade-off:** The 14-day correction window does not catch source changes made later than that. Season statistics can also require more requests during an active season; measure the nightly runtime on EC2 before scheduling.
+**Trade-off:** The 7-day correction window does not catch source changes made later than that. Season statistics can also require more requests during an active season; measure the nightly runtime on EC2 before scheduling.
