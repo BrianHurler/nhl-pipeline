@@ -1,8 +1,9 @@
-"""Build games and play-by-play Parquets for one NHL season from the S3 raw archive.
+"""Build games, plays, and shifts Parquets for one NHL season from the S3 raw archive.
 
 Examples:
   python scripts/02_build_season_parquets.py --season-id 20262027
-  python scripts/02_build_season_parquets.py --season-id 20262027 --publish
+  python scripts/02_build_season_parquets.py --active-season
+  python scripts/02_build_season_parquets.py --active-season --publish
 
 Requires NHL_S3_BUCKET; optional NHL_S3_PREFIX. Default is local-only.
 """
@@ -10,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from datetime import date
 
 import boto3
 import duckdb
@@ -18,12 +20,17 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "aws-parquet-data"
 
-parser = argparse.ArgumentParser(description="Build NHL season games and plays Parquets")
-parser.add_argument("--season-id", required=True, help="Eight-digit season ID, e.g. 20262027")
+parser = argparse.ArgumentParser(description="Build NHL season games, plays and shifts Parquets")
+choice = parser.add_mutually_exclusive_group(required=True)
+choice.add_argument("--season-id", help="Eight-digit season ID, e.g. 20262027")
+choice.add_argument("--active-season", action="store_true", help="Choose NHL season automatically; rollover October 1 UTC")
 parser.add_argument("--publish", action="store_true", help="Upload validated Parquets to S3")
 args = parser.parse_args()
 
-season = args.season_id
+today = date.today()
+start_year = today.year if today.month >= 10 else today.year - 1
+season = args.season_id or f"{start_year}{start_year + 1}"
+print(f"Building NHL season {season}; UTC date {today}", flush=True)
 if len(season) != 8 or not season.isdigit() or int(season[4:]) != int(season[:4]) + 1:
     parser.error("--season-id must represent consecutive years as eight digits")
 
@@ -146,23 +153,64 @@ if plays["game_id"].nunique() != len(completed):
 if games["game_type"].eq(1).any() or plays["game_type"].eq(1).any():
     raise RuntimeError("Preseason games detected in analytical output")
 
+# Shift charts use the NHL Stats REST "data" list. Require coverage for each
+# completed non-preseason game rather than silently exporting missing games.
+shift_root = object_key("raw-api-data", season, "shifts")
+shift_keys = list_keys(shift_root)
+shift_by_game = {
+    int(Path(key).stem): key for key in shift_keys if Path(key).stem.isdigit()
+}
+missing_shifts = sorted(set(completed) - set(shift_by_game))
+if missing_shifts:
+    raise RuntimeError(
+        f"Missing shift JSON for {len(missing_shifts)} completed games; "
+        f"first IDs: {missing_shifts[:10]}"
+    )
+shift_frames = []
+for game_id in sorted(completed):
+    doc = read_json(shift_by_game[game_id])
+    rows = doc.get("data")
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Missing/invalid shift records for completed game {game_id}")
+    frame = pd.json_normalize(rows, sep="_")
+    if "gameId" in frame:
+        if not frame["gameId"].astype(str).eq(str(game_id)).all():
+            raise RuntimeError(f"Shift game ID mismatch for {game_id}")
+        frame = frame.drop(columns=["gameId"])
+    frame.insert(0, "game_id", game_id)
+    frame.insert(1, "game_date", str(completed[game_id]["gameDate"])[:10])
+    frame.insert(2, "game_type", int(completed[game_id]["gameType"]))
+    shift_frames.append(frame)
+
+shifts = pd.concat(shift_frames, ignore_index=True, sort=False)
+if "id" not in shifts or shifts["id"].isna().any():
+    raise RuntimeError("Shift IDs are missing or null")
+if shifts.duplicated(["game_id", "id"]).any():
+    raise RuntimeError("Duplicate shift IDs within a game")
+if shifts["game_id"].nunique() != len(completed) or shifts["game_type"].eq(1).any():
+    raise RuntimeError("Shift coverage mismatch or preseason shifts detected")
+
 # Season lives in the Hive directory; avoid conflicting duplicate season columns.
 label = f"{season[:4]}-{season[4:]}"
 games_file = OUTPUT / "games" / f"season={season}" / f"games_{label}.parquet"
 plays_file = OUTPUT / "plays" / f"season={season}" / f"plays_{label}.parquet"
-for path in (games_file, plays_file):
+shifts_file = OUTPUT / "shifts" / f"season={season}" / f"shifts_{label}.parquet"
+for path in (games_file, plays_file, shifts_file):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 games["game_date"] = pd.to_datetime(games["game_date"]).dt.date
 plays["game_date"] = pd.to_datetime(plays["game_date"]).dt.date
+shifts["game_date"] = pd.to_datetime(shifts["game_date"]).dt.date
 games.to_parquet(games_file, index=False, compression="zstd")
 plays.to_parquet(plays_file, index=False, compression="zstd")
+shifts.to_parquet(shifts_file, index=False, compression="zstd")
 
-# Validate both Parquet files before optional publication.
+# Validate all Parquet files before optional publication.
 con = duckdb.connect()
 for name, path, expected in (
     ("games", games_file, len(games)),
     ("plays", plays_file, len(plays)),
+    ("shifts", shifts_file, len(shifts)),
 ):
     actual = con.execute(
         "SELECT count(*) FROM read_parquet(?)", [str(path)]
@@ -172,7 +220,7 @@ for name, path, expected in (
     print(f"{name}: {actual:,} rows | {path.stat().st_size / 1024**2:.2f} MiB | {path}")
 
 if args.publish:
-    for path in (games_file, plays_file):
+    for path in (games_file, plays_file, shifts_file):
         key = object_key("nhl-parquet", *path.relative_to(OUTPUT).parts)
         s3.upload_file(str(path), bucket, key)
         print(f"Published: s3://{bucket}/{key}")
