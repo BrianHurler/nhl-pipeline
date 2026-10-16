@@ -87,6 +87,14 @@ if len(records) != expected_total or len(ids) != len(set(ids)):
 if not all(str(row["season"]) == season for row in records):
     raise RuntimeError("Catalog contains games from another season")
 
+# Preserve preseason in the raw archive, but exclude it from every analytical table.
+# NHL game_type 1 is preseason; retain other types (including regular season/playoffs).
+preseason_games = sum(int(row["gameType"]) == 1 for row in records)
+records = [row for row in records if int(row["gameType"]) != 1]
+if not records:
+    raise RuntimeError("No non-preseason games found in the season catalog")
+print(f"Excluded {preseason_games:,} preseason games from Parquet outputs")
+
 # One game per row, including future games listed by the NHL catalog.
 games = pd.DataFrame([{
     "game_id": int(game["id"]),
@@ -135,6 +143,8 @@ if plays["eventId"].isna().any() or plays.duplicated(["game_id", "eventId"]).any
     raise RuntimeError("Null or duplicate (game_id, eventId) keys")
 if plays["game_id"].nunique() != len(completed):
     raise RuntimeError("Play-by-play game coverage differs from completed game catalog")
+if games["game_type"].eq(1).any() or plays["game_type"].eq(1).any():
+    raise RuntimeError("Preseason games detected in analytical output")
 
 # Season lives in the Hive directory; avoid conflicting duplicate season columns.
 label = f"{season[:4]}-{season[4:]}"
