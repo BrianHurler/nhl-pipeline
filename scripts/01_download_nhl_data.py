@@ -27,8 +27,8 @@ parser.add_argument("--nightly", action="store_true",
 parser.add_argument("--lookback-days", type=int, default=180)
 parser.add_argument("--start-year", type=int, default=2016,
                     help="First season start year for multi-season runs (default: 2016)")
-parser.add_argument("--refresh-days", type=int, default=14,
-                    help="Refresh last N days of games and relevant reports (default: 14)")
+parser.add_argument("--refresh-days", type=int, default=7,
+                    help="Refresh last N days of games and relevant reports (default: 7)")
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--max-downloads", type=int, default=0)
 parser.add_argument("--max-games", type=int, default=0,
@@ -340,10 +340,10 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
 
 print(f"Game stage finished in {(time.perf_counter() - game_stage_start) / 60:.1f} minutes.", flush=True)
 
-# Read fresh box scores to find players who participated in recently completed games.
-# If any recent box score is missing or lacks player groups, refresh all season logs safely.
+# Read fresh box scores to find recent participants by season and game type.
+# If a box score is missing or malformed, refresh that season/game type safely.
 recent_players = {}
-fallback_seasons = set()
+fallback_season_types = set()
 if args.nightly and not args.games_only:
     recent_games = [
         game for game in completed_games.values()
@@ -351,6 +351,7 @@ if args.nightly and not args.games_only:
     ]
     for game in recent_games:
         season = game["season"]
+        kind = game["gameType"]
         box_file = RAW / season / "boxscore" / f"{game['id']}.json"
         try:
             box = json.loads(box_file.read_text(encoding="utf-8"))
@@ -366,14 +367,17 @@ if args.nightly and not args.games_only:
                     players_in_game.update(int(row["playerId"]) for row in members)
             if not players_in_game:
                 raise ValueError("Empty box score player inventory")
-            recent_players.setdefault(season, set()).update(players_in_game)
+            recent_players.setdefault((season, kind), set()).update(players_in_game)
         except (OSError, ValueError, KeyError, TypeError) as error:
-            fallback_seasons.add(season)
+            fallback_season_types.add((season, kind))
             print(f"Box score {game['id']} not usable ({error}); "
-                  f"using complete player-log refresh for {season}.", flush=True)
-    print(f"Recent participants: "
-          f"{ {season: len(ids) for season, ids in sorted(recent_players.items())} }; "
-          f"fallback seasons: {sorted(fallback_seasons)}", flush=True)
+                  f"refreshing all player logs for {season}, game type {kind}.", flush=True)
+    participant_counts = {
+        f"{season}/{kind}": len(ids)
+        for (season, kind), ids in sorted(recent_players.items())
+    }
+    print(f"Recent participants by season/game type: {participant_counts}; "
+          f"fallback season/types: {sorted(fallback_season_types)}", flush=True)
 
 # Run the game archive by itself before collecting supplementary datasets.
 # This makes a full-season pilot easier to validate and safely resume.
@@ -481,22 +485,23 @@ for season, team in sorted(team_seasons):
     for kind in (k for sid, k in season_types if sid == season):
         log_jobs.update((season, kind, player_id) for player_id in player_ids)
 
-# For nightly runs, refresh only recent participants' season-to-date game logs.
+# For nightly runs, refresh only season/game-type logs for recent participants.
 # Any missing archived player log is still downloaded by get_json, regardless of refresh.
-# When a recent box score cannot be parsed, refresh all logs for that season as a fallback.
-def refresh_player_log(season, player_id):
+# When a recent box score cannot be parsed, refresh logs for its season/game type.
+def refresh_player_log(season, kind, player_id):
     if not args.nightly:
         return season.startswith(str(current_start_year))
     if season not in recent_seasons:
         return False
-    return season in fallback_seasons or player_id in recent_players.get(season, set())
+    return ((season, kind) in fallback_season_types
+            or player_id in recent_players.get((season, kind), set()))
 
 
 # Download player game logs in parallel after the roster inventory is complete.
 log_requests = [
     (f"{WEB}/player/{player_id}/game-log/{season}/{kind}",
      RAW / season / "player_game_logs" / str(kind) / f"{player_id}.json",
-     None, refresh_player_log(season, player_id))
+     None, refresh_player_log(season, kind, player_id))
     for season, kind, player_id in sorted(log_jobs)
 ]
 if args.nightly:
