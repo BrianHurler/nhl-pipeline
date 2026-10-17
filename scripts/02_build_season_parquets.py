@@ -153,26 +153,18 @@ if plays["game_id"].nunique() != len(completed):
 if games["game_type"].eq(1).any() or plays["game_type"].eq(1).any():
     raise RuntimeError("Preseason games detected in analytical output")
 
-# Shift charts use the NHL Stats REST "data" list. Require coverage for each
-# completed non-preseason game rather than silently exporting missing games.
-shift_root = object_key("raw-api-data", season, "shifts")
-shift_keys = list_keys(shift_root)
-shift_by_game = {
-    int(Path(key).stem): key for key in shift_keys if Path(key).stem.isdigit()
-}
-missing_shifts = sorted(set(completed) - set(shift_by_game))
-if missing_shifts:
-    raise RuntimeError(
-        f"Missing shift JSON for {len(missing_shifts)} completed games; "
-        f"first IDs: {missing_shifts[:10]}"
-    )
+# Missing or empty shift charts are retried live and tracked across nights.
+# Games and plays remain publishable even when some shift data is unavailable.
+from shift_recovery import recover_shifts
+
+shift_documents = recover_shifts(
+    s3=s3, bucket=bucket, prefix=prefix, season=season,
+    completed=completed, read_json=read_json, list_keys=list_keys,
+    publish=args.publish,
+)
 shift_frames = []
-for game_id in sorted(completed):
-    doc = read_json(shift_by_game[game_id])
-    rows = doc.get("data")
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"Missing/invalid shift records for completed game {game_id}")
-    frame = pd.json_normalize(rows, sep="_")
+for game_id, doc in sorted(shift_documents.items()):
+    frame = pd.json_normalize(doc["data"], sep="_")
     if "gameId" in frame:
         if not frame["gameId"].astype(str).eq(str(game_id)).all():
             raise RuntimeError(f"Shift game ID mismatch for {game_id}")
@@ -182,13 +174,15 @@ for game_id in sorted(completed):
     frame.insert(2, "game_type", int(completed[game_id]["gameType"]))
     shift_frames.append(frame)
 
+if not shift_frames:
+    raise RuntimeError("No valid shifts available; refusing to replace shifts Parquet")
 shifts = pd.concat(shift_frames, ignore_index=True, sort=False)
 if "id" not in shifts or shifts["id"].isna().any():
-    raise RuntimeError("Shift IDs are missing or null")
+    raise RuntimeError("Shift record ID missing or null")
 if shifts.duplicated(["game_id", "id"]).any():
-    raise RuntimeError("Duplicate shift IDs within a game")
-if shifts["game_id"].nunique() != len(completed) or shifts["game_type"].eq(1).any():
-    raise RuntimeError("Shift coverage mismatch or preseason shifts detected")
+    raise RuntimeError("Duplicate shift IDs within game")
+if shifts["game_type"].eq(1).any():
+    raise RuntimeError("Preseason shifts detected")
 
 # Season lives in the Hive directory; avoid conflicting duplicate season columns.
 label = f"{season[:4]}-{season[4:]}"
